@@ -1,66 +1,132 @@
-import os
-from dotenv import load_dotenv
 import boto3
+import json
+import os
+from datetime import datetime, timezone, timedelta
+import tempfile
+import mimetypes
 
-# Cargar variables de entorno
-load_dotenv()
+CONFIG_FILE = "config.json"
+LAST_CONFIG_FILE = "last_config.json"
 
-# ===== Cloudflare R2 =====
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
-R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
-R2_ENDPOINT = os.getenv("R2_ENDPOINT")
+# ---------- Funciones de helpers ----------
 
-r2_client = boto3.client(
-    "s3",
-    region_name="auto",
-    endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-)
+def load_config():
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
 
-# ===== MinIO =====
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
-MINIO_BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME")
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")
+def load_last_config():
+    if os.path.exists(LAST_CONFIG_FILE):
+        with open(LAST_CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
 
-minio_client = boto3.client(
-    "s3",
-    region_name="us-east-1",
-    endpoint_url=MINIO_ENDPOINT,
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-)
+def save_last_config(data):
+    with open(LAST_CONFIG_FILE, "w") as f:
+        json.dump(data, f)
 
-# ===== Funciones para listar archivos =====
-def list_files_s3(client, bucket_name):
-    """Lista todos los objetos en un bucket S3"""
-    files = []
-    paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket_name):
-        for obj in page.get("Contents", []):
-            files.append(obj["Key"])
-    return files
+# ---------- Conexiones S3 ----------
 
-# ===== Listar archivos =====
-r2_files = list_files_s3(r2_client, R2_BUCKET_NAME)
-minio_files = list_files_s3(minio_client, MINIO_BUCKET_NAME)
+def create_s3_client(endpoint_url, access_key, secret_key):
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key
+    )
 
-# ===== Comparar y mostrar =====
-print(f"Archivos en R2 ({R2_BUCKET_NAME}): {len(r2_files)}")
-print(f"Archivos en MinIO ({MINIO_BUCKET_NAME}): {len(minio_files)}\n")
+# ---------- Lógica de sincronización ----------
 
-r2_set = set(r2_files)
-minio_set = set(minio_files)
+def sync_r2_to_minio():
+    config = load_config()
+    last_config = load_last_config()
+    
+    r2 = config["r2"]
+    minio = config["minio"]
+    paths = config["paths"]
+    dias_ultimos = config.get("dias_ultimos", 7)  # configurable desde config.json
+    
+    # Crear cliente MinIO
+    minio_client = create_s3_client(minio["endpoint_url"], minio["access_key"], minio["secret_key"])
 
-solo_r2 = r2_set - minio_set
-solo_minio = minio_set - r2_set
+    # ---------- Revisar si dias_ultimos disminuyó ----------
+    dias_ultimos_anterior = last_config.get("dias_ultimos", dias_ultimos)
+    if dias_ultimos < dias_ultimos_anterior:
+        print(f"[INFO] dias_ultimos disminuyó ({dias_ultimos_anterior} -> {dias_ultimos}), eliminando archivos antiguos en MinIO...")
+        for path in paths:
+            # Listar y eliminar objetos que empiezan con path
+            response = minio_client.list_objects_v2(Bucket=minio["bucket"], Prefix=path)
+            if "Contents" in response:
+                for obj in response["Contents"]:
+                    obj_key = obj["Key"]
+                    minio_client.delete_object(Bucket=minio["bucket"], Key=obj_key)
+                    print(f"[DELETE] {obj_key} eliminado")
+        print("[INFO] MinIO limpio ✅")
+    
+    # Guardar el valor actual de dias_ultimos
+    save_last_config({"dias_ultimos": dias_ultimos})
+    
+    # ---------- Sincronización ----------
+    now = datetime.now(timezone.utc)
+    fecha_limite = now - timedelta(days=dias_ultimos)
+    
+    print(f"Sincronizando archivos de los últimos {dias_ultimos} días desde {fecha_limite} hasta {now}")
+    
+    r2_client = create_s3_client(r2["endpoint_url"], r2["access_key"], r2["secret_key"])
+    
+    for path in paths:
+        response = r2_client.list_objects_v2(Bucket=r2["bucket"], Prefix=path)
+        if "Contents" not in response:
+            print(f"No se encontraron archivos en la ruta: {path}")
+            continue
+        
+        for obj in response["Contents"]:
+            obj_key = obj["Key"]
+            last_modified = obj["LastModified"].replace(tzinfo=timezone.utc)
+            
+            # Filtrar solo archivos de los últimos N días
+            if last_modified < fecha_limite:
+                print(f"[SKIP] {obj_key} es anterior a los últimos {dias_ultimos} días")
+                continue
+            
+            print(f"[INFO] Archivo encontrado: {obj_key} - LastModified: {last_modified}")
+            
+            # Descargar archivo a temp
+            local_file = os.path.join(tempfile.gettempdir(), os.path.basename(obj_key))
+            try:
+                print(f"[DOWNLOAD] Descargando {obj_key} a {local_file}")
+                r2_client.download_file(r2["bucket"], obj_key, local_file)
+            except Exception as e:
+                print(f"[ERROR] No se pudo descargar {obj_key}: {e}")
+                continue
+            
+            # Detectar tipo de contenido automáticamente
+            content_type, _ = mimetypes.guess_type(local_file)
+            if content_type is None:
+                content_type = "application/octet-stream"
+            
+            # Subir a MinIO con ContentType y ContentDisposition=inline
+            try:
+                print(f"[UPLOAD] Subiendo {obj_key} a MinIO bucket {minio['bucket']}")
+                minio_client.upload_file(
+                    local_file,
+                    minio["bucket"],
+                    obj_key,
+                    ExtraArgs={
+                        "ContentType": content_type,
+                        "ContentDisposition": "inline"
+                    }
+                )
+                print(f"[OK] Sincronizado: {obj_key} con ContentType={content_type}")
+            except Exception as e:
+                print(f"[ERROR] No se pudo subir {obj_key} a MinIO: {e}")
+                continue
+            finally:
+                if os.path.exists(local_file):
+                    os.remove(local_file)
+    
+    print("Sincronización completada ✅")
 
-print(f"Archivos solo en R2 ({len(solo_r2)}):")
-for f in solo_r2:
-    print(f"  {f}")
+# ---------- Ejecutar ----------
 
-print(f"\nArchivos solo en MinIO ({len(solo_minio)}):")
-for f in solo_minio:
-    print(f"  {f}")
+if __name__ == "__main__":
+    sync_r2_to_minio()
