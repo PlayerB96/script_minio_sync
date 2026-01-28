@@ -4,7 +4,7 @@
 source "$(dirname "$0")/venv/bin/activate"
 
 # Ejecutar script
-python "$(dirname "$0")/script_minio.py"
+python "$(dirname "$0")/app.py"
 
 # Desactivar virtualenv
 deactivate
