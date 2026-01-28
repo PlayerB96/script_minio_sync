@@ -1,10 +1,13 @@
 #!/bin/bash
 
-# Activar virtualenv (ruta relativa desde el script)
-source "$(dirname "$0")/venv/bin/activate"
+# Ir a la carpeta donde está el script
+cd "$(dirname "$0")"
+
+# Activar virtualenv
+source ./venv/bin/activate
 
 # Ejecutar script
-python "$(dirname "$0")/app.py"
+python app.py
 
 # Desactivar virtualenv
 deactivate
